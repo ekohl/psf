@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+
+from socketserver import ThreadingUnixStreamServer, StreamRequestHandler
+import json
+import logging
+import os
+import socket
+
+import requests
+import yaml
+
+SESSION = requests.Session()
+
+try:
+    FOREMAN_URL = os.environ['FOREMAN_URL']
+    SESSION.auth = (os.environ['FOREMAN_USERNAME'], os.environ['FOREMAN_PASSWORD'])
+except KeyError as e:
+    raise SystemExit(f'Missing environment variable: {e}')
+
+try:
+    SESSION.verify = os.environ['FOREMAN_CA_CERTIFICATE']
+except KeyError:
+    logging.debug('Using system certificate store')
+
+try:
+    SESSION.verify = os.environ['FOREMAN_CA_CERTIFICATE']
+except KeyError:
+    logging.debug('Using system certificate store')
+
+
+class PsfException(Exception):
+    def __init__(self, code, message, hostname=None):
+        super().__init__()
+        self.code = code
+        self.message = message
+        self.hostname = hostname
+
+
+def load_json_or_yaml(data):
+    try:
+        return json.loads(data)
+    except:
+        try:
+            return yaml.safe_load(data)
+        except:
+            raise PsfException(400, 'Invalid JSON/YAML')
+
+
+def decode_response(response):
+    code, message = response.status_code, response.reason
+    if code != requests.codes.ok:
+        try:
+            message = response.json()['message']
+        except:
+            pass
+    return (code, message)
+
+
+class BaseHandler(StreamRequestHandler):
+    LOGGER = None
+
+    def handle(self):
+        self.LOGGER.debug('New connection')
+        data = self.rfile.read().strip().decode('utf-8')
+        if not data:
+            self.LOGGER.debug('No data received')
+            return
+
+        try:
+            code, message, hostname = self.process_data(data)
+        except PsfException as ex:
+            code, message, hostname = ex.code, ex.message, ex.hostname
+            if hostname:
+                self.LOGGER.exception('Error processing data for %s: %s %s', hostname, code, message)
+            else:
+                self.LOGGER.exception('Error processing data: %s %s', code, message)
+
+        try:
+            self.wfile.write(b'%i %s\n' % (code, message.encode('utf-8')))
+        except BrokenPipeError:
+            if hostname:
+                self.LOGGER.warning('Client for %s disconnected prematurely', hostname)
+            else:
+                self.LOGGER.warning('Client disconnected prematurely')
+
+    def process_data(self, data):
+        raise NotImplementedError
+
+
+class EncHandler(StreamRequestHandler):
+    """
+    The Puppet ENC handler.
+
+    The protocol is that the client sends a single line which contains the
+    hostname. On a correct response a YAML structure is returned. If a node is not
+    found, nothing is returned.
+
+    See https://puppet.com/docs/puppet/7/nodes_external.html#enc_output_format
+    """
+
+    LOGGER = logging.getLogger('enc')
+
+    def handle(self):
+        self.LOGGER.debug('New connection')
+        hostname = self.rfile.readline().strip().decode('utf-8')
+        self.LOGGER.info("Request for: %s", hostname)
+        if hostname:
+            # TODO: validate hostname
+            data = self.get_enc(hostname)
+            if data:
+                try:
+                    self.send_enc(data)
+                except Exception as e: # TODO: specific
+                    self.LOGGER.exception('Error sending ENC for %s: %s', hostname, e)
+
+    def get_enc(self, hostname):
+        url = f'{FOREMAN_URL}/api/v2/hosts/{hostname}/enc'
+        self.LOGGER.info('GET %s', url)
+        try:
+            response = SESSION.get(url)
+        except Exception as e: # TODO: specific
+            self.LOGGER.exception('Error retrieving ENC for %s: %s', hostname, e)
+            return None
+        else:
+            self.LOGGER.info('ENC for %s: %s', hostname, response.status_code)
+            if response.status_code == requests.codes.ok:
+                return response.json()['data']
+            else:
+                # TODO: error handling
+                return None
+
+    def send_enc(self, data):
+        output = yaml.safe_dump(data)
+        self.wfile.write(output.encode('utf-8'))
+
+
+class FactsHandler(BaseHandler):
+    """
+    The Puppet Facts handler.
+
+    The protocol is that the client sends the facts (preferably JSON, otherwise
+    YAML). This must contain a the keys 'name' and 'values' while 'certname' is
+    optional. The server then sends the facts to the backend. The response is
+    written back in the form of a numeric HTTP code and a message separated by
+    a single space.
+
+    See https://puppet.com/docs/puppet/7/nodes_external.html#enc_output_format
+    """
+
+    LOGGER = logging.getLogger('facts')
+
+    def process_data(self, raw_data):
+        facts, hostname, certname = self.load_facts(raw_data)
+        self.LOGGER.info("Sending facts for %s", hostname)
+        code, message = self.send_facts(facts, hostname, certname)
+
+        return (code, message, hostname)
+
+    @staticmethod
+    def load_facts(raw_data):
+        data = load_json_or_yaml(raw_data)
+        # TODO: assert data is a dict?
+
+        hostname = None
+        try:
+            hostname = data['name']
+            facts = data['values']
+        except KeyError as ex:
+            raise PsfException(422, 'Invalid data received', hostname) from ex
+        certname = data.get('certname')
+        return (facts, hostname, certname)
+
+    def send_facts(self, facts, hostname, certname=None):
+        url = f'{FOREMAN_URL}/api/v2/hosts/facts'
+        data = {'facts': facts, 'name': hostname}
+        if certname:
+            data['certname'] = certname
+
+        self.LOGGER.info('POST %s for %s', url, hostname)
+        try:
+            response = SESSION.post(url, json=data)
+        except requests.RequestException as ex:
+            if certname and hostname != certname:
+                self.LOGGER.error('Error sending facts for %s (%s): %s', hostname, certname, ex)
+            else:
+                self.LOGGER.error('Error sending facts for %s: %s', hostname, ex)
+            raise PsfException(500, 'Failed to upload facts', hostname) from ex
+
+        code, message = decode_response(response)
+        self.LOGGER.info('Facts for %s: %s %s', hostname, code, message)
+
+        return (code, message)
+
+
+class ReportHandler(BaseHandler):
+
+    LOGGER = logging.getLogger('report')
+
+    def process_data(self, raw_data):
+        # Puppet serializes the Ruby object
+        raw_data = raw_data.replace('--- !ruby/object:Puppet::Transaction::Report', '---')
+
+        report = load_json_or_yaml(raw_data)
+        config_report = self.build_config_report(report)
+        hostname = config_report['config_report']['host']
+        code, message = self.send_report(config_report)
+
+        return (code, message, hostname)
+
+    def send_report(self, config_report):
+        hostname = config_report['config_report']['host']
+        url = f'{FOREMAN_URL}/api/v2/config_reports'
+        self.LOGGER.info('POST %s for %s', url, hostname)
+        self.LOGGER.debug('Config report: %r', config_report)
+        try:
+            response = SESSION.post(url, json=config_report)
+        except requests.RequestException as ex:
+            self.LOGGER.error("Failed to send config report for %s: %s", hostname, ex)
+            raise PsfException(500, 'Report upload failed', hostname) from ex
+
+        code, message = decode_response(response)
+        self.LOGGER.info('Report for %s: %s %s', hostname, code, message)
+
+        return (code, message)
+
+    @classmethod
+    def build_config_report(cls, report):
+        """
+        Change the Puppet format report format to what Foreman's API
+        understands.
+        """
+        hostname = None
+        try:
+            hostname = report['host']
+            return {
+                'config_report': {
+                    'host': hostname,
+                    'reported_at': report['time'],
+                    'status': cls.calculate_status(report),
+                    'metrics': cls.format_metrics(report['metrics']),
+                    'logs': list(cls.format_logs(report['logs'])),
+                },
+            }
+        except Exception as e:
+            raise PsfException(422,
+                    f"Failed to construct Foreman's config report from Puppet report: {e}",
+                    hostname) from e
+
+    @staticmethod
+    def calculate_status(report):
+        # https://puppet.com/docs/puppet/7/format_report.html#puppet-util-metric
+        metrics = report['metrics']
+
+        statuses = {
+            'applied': metrics['changes'].get('total', 0),
+            'restarted': metrics['resources'].get('restarted', 0),
+            'failed': metrics['resources'].get('failed', 0),
+            'failed_restarts': metrics['resources'].get('failed_to_restart', 0),
+            'skipped': metrics['resources'].get('skipped', 0),
+            'pending': metrics['events'].get('noop', 0),
+        }
+
+        # special fix for false warning about skips
+        # sometimes there are skip values, but there are no error messages, we ignore them.
+        if statuses['skipped'] and (sum(statuses.values()) - statuses['skipped'] == len(report['logs'])):
+            statuses['skipped'] = 0
+
+        # fix for reports that contain no metrics (i.e. failed catalog)
+        if report.get('status') == 'failed':
+          statuses["failed"] += 1
+
+        # fix for Puppet non-resource errors (i.e. failed catalog fetches before falling back to cache)
+        statuses["failed"] += sum(1 for l in report['logs'] if l['source'].endswith('Puppet') and l['level'] == 'err')
+
+        return statuses
+
+    @staticmethod
+    def format_metrics(metrics):
+        """
+        Convert Puppet's metrics to Foreman's API format.
+        """
+        # https://puppet.com/docs/puppet/7/format_report.html#puppet-util-metric
+        return {name: {n: v for n, _, v in metric['values']} for name, metric in metrics.items()}
+
+    @staticmethod
+    def format_logs(logs):
+        """
+        Convert Puppet's logs to match Foreman's slightly odd API format.
+        """
+        # https://puppet.com/docs/puppet/7/format_report.html#puppet-util-log
+        for log in logs:
+            # TODO next if log.message =~ /^Finished catalog run in \d+.\d+ seconds$/
+            if log['level'] != 'debug':
+                yield {
+                    'log': {
+                        'level': log['level'],
+                        'sources': {'source': log['source']},
+                        'messages': {'message': log['message']},
+                    },
+                }
+
+
+class Server(ThreadingUnixStreamServer):
+
+    # The constant would be better initialized by a systemd module
+    SYSTEMD_FIRST_SOCKET_FD = 3
+
+    def __init__(self, server_address, handler_cls):
+        # Invoke base but omit bind/listen steps (performed by systemd activation!)
+        super().__init__(server_address, handler_cls, bind_and_activate=False)
+        # Override socket
+        self.socket = socket.fromfd(
+            self.SYSTEMD_FIRST_SOCKET_FD, self.address_family, self.socket_type)
+
+
+HANDLERS = {
+    'enc': EncHandler,
+    'facts': FactsHandler,
+    'report': ReportHandler,
+}
+
+if __name__ == "__main__":
+    import sys
+    logging.basicConfig(level=logging.DEBUG)
+
+    try:
+        handler_name = sys.argv[1]
+    except IndexError:
+        print(f'Usage: {sys.argv[0]} HANDLER')
+        sys.exit(1)
+
+    try:
+        handler = HANDLERS[handler_name]
+    except KeyError:
+        print(f'Unknown handler "{handler_name}"')
+        sys.exit(1)
+
+    server = Server(f'/{handler_name}', handler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass

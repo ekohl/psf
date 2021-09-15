@@ -1,0 +1,11 @@
+[Unit]
+Description=Foreman integration for Puppetserver
+After=network.target
+
+[Socket]
+ListenStream=/run/psf/%i
+SocketUser=puppet
+SocketMode=0600
+
+[Install]
+WantedBy=sockets.target

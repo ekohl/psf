@@ -1,0 +1,25 @@
+[Unit]
+Description=Foreman integration for Puppetserver
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/puppetserver-foreman %i
+EnvironmentFile=/etc/psf/credentials
+
+# TODO: Some of these are unknown on EL7
+#RestrictAddressFamilies=AF_(INET|INET6)
+RestrictNamespaces=yes
+PrivateDevices=yes
+PrivateMounts=yes
+PrivateTmp=yes
+PrivateUsers=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=full
+DynamicUser=yes
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=sockets.target
