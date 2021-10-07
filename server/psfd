@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 from socketserver import ThreadingUnixStreamServer, StreamRequestHandler
+from typing import Generator, Optional, Tuple
 import json
 import logging
 import os
@@ -11,21 +12,58 @@ import yaml
 
 SESSION = requests.Session()
 
-try:
-    FOREMAN_URL = os.environ['FOREMAN_URL']
-    SESSION.auth = (os.environ['FOREMAN_USERNAME'], os.environ['FOREMAN_PASSWORD'])
-except KeyError as e:
-    raise SystemExit(f'Missing environment variable: {e}')
+
+def load_settings_direct() -> str:
+    try:
+        foreman_url = os.environ['FOREMAN_URL']
+        SESSION.auth = (os.environ['FOREMAN_USERNAME'], os.environ['FOREMAN_PASSWORD'])
+    except KeyError as e:
+        raise ValueError(f'Missing environment variable: {e}') from e
+
+    try:
+        SESSION.verify = os.environ['FOREMAN_CA_CERTIFICATE']
+    except KeyError:
+        logging.debug('Using system certificate store')
+
+    return foreman_url
+
+
+def load_settings_proxy() -> str:
+    path = os.environ.get('FOREMAN_PROXY_SETTINGS', '/etc/foreman-proxy/settings.yml')
+    with open(path) as fp:
+        config = yaml.safe_load(fp)
+
+    foreman_url = config.get(':foreman_url')
+    if not foreman_url:
+        raise ValueError(f'Unable to determine Foreman URL from {path}')
+
+    ca_file = config.get(':foreman_ssl_ca', config.get(':ssl_ca_file'))
+    if ca_file:
+        SESSION.verify = ca_file
+
+    cert_file = config.get(':foreman_ssl_cert', config.get(':ssl_certificate'))
+    key_file = config.get(':foreman_ssl_key', config.get(':ssl_private_key'))
+
+    if key_file and cert_file:
+        SESSION.cert = (cert_file, key_file)
+    elif cert_file:
+        SESSION.cert = cert_file
+    else:
+        raise ValueError(f'Unable to determine client certificates to {foreman_url}')
+
+    return foreman_url
+
+def load_settings(mode: str) -> str:
+    if mode == 'direct':
+        return load_settings_direct()
+    if mode == 'proxy':
+        return load_settings_proxy()
+    raise ValueError('Unknown mode')
 
 try:
-    SESSION.verify = os.environ['FOREMAN_CA_CERTIFICATE']
-except KeyError:
-    logging.debug('Using system certificate store')
-
-try:
-    SESSION.verify = os.environ['FOREMAN_CA_CERTIFICATE']
-except KeyError:
-    logging.debug('Using system certificate store')
+    FOREMAN_URL = load_settings('direct')  # TODO: mode
+except ValueError as e:
+    raise SystemExit(str(e)) from e
 
 
 class PsfException(Exception):
@@ -57,7 +95,7 @@ def decode_response(response):
 
 
 class BaseHandler(StreamRequestHandler):
-    LOGGER = None
+    LOGGER: logging.Logger = logging.getLogger('Base')
 
     def handle(self):
         self.LOGGER.debug('New connection')
@@ -83,7 +121,7 @@ class BaseHandler(StreamRequestHandler):
             else:
                 self.LOGGER.warning('Client disconnected prematurely')
 
-    def process_data(self, data):
+    def process_data(self, data: str) -> Tuple[int, str, str]:
         raise NotImplementedError
 
 
@@ -100,7 +138,7 @@ class EncHandler(StreamRequestHandler):
 
     LOGGER = logging.getLogger('enc')
 
-    def handle(self):
+    def handle(self) -> None:
         self.LOGGER.debug('New connection')
         hostname = self.rfile.readline().strip().decode('utf-8')
         self.LOGGER.info("Request for: %s", hostname)
@@ -113,25 +151,49 @@ class EncHandler(StreamRequestHandler):
                 except Exception as e: # TODO: specific
                     self.LOGGER.exception('Error sending ENC for %s: %s', hostname, e)
 
-    def get_enc(self, hostname):
-        url = f'{FOREMAN_URL}/api/v2/hosts/{hostname}/enc'
-        self.LOGGER.info('GET %s', url)
+    def get_enc(self, hostname: str) -> Optional[str]:
+        """
+        Get the ENC from Foreman
+
+        If a certificate is configured, we're using the endpoint that accepts client certificates.
+        Otherwise we fall back to the regular API endpoint.
+        """
         try:
-            response = SESSION.get(url)
-        except Exception as e: # TODO: specific
+            if SESSION.cert:
+                data = self.get_enc_proxy(hostname)
+            else:
+                data = self.get_enc_direct(hostname)
+        except requests.RequestException as e:
             self.LOGGER.exception('Error retrieving ENC for %s: %s', hostname, e)
             return None
-        else:
-            self.LOGGER.info('ENC for %s: %s', hostname, response.status_code)
-            if response.status_code == requests.codes.ok:
-                return response.json()['data']
-            else:
-                # TODO: error handling
-                return None
 
-    def send_enc(self, data):
-        output = yaml.safe_dump(data)
-        self.wfile.write(output.encode('utf-8'))
+        return data
+
+    def get_enc_direct(self, hostname: str) -> Optional[str]:
+        url = f'{FOREMAN_URL}/api/v2/hosts/{hostname}/enc'
+        self.LOGGER.info('GET %s', url)
+        response = SESSION.get(url)
+        self.LOGGER.info('ENC for %s: %s', hostname, response.status_code)
+        if response.status_code == requests.codes.ok:
+            data = response.json()['data']
+            return yaml.safe_dump(data)
+        else:
+            # TODO: error handling
+            return None
+
+    def get_enc_proxy(self, hostname: str) -> Optional[str]:
+        url = f'{FOREMAN_URL}/node/{hostname}'
+        self.LOGGER.info('GET %s', url)
+        response = SESSION.get(url, params={'format': 'yml'})
+        self.LOGGER.info('ENC for %s: %s', hostname, response.status_code)
+        if response.status_code == requests.codes.ok:
+            return response.text
+        else:
+            # TODO: error handling
+            return None
+
+    def send_enc(self, data: str) -> None:
+        self.wfile.write(data.encode('utf-8'))
 
 
 class FactsHandler(BaseHandler):
@@ -149,7 +211,7 @@ class FactsHandler(BaseHandler):
 
     LOGGER = logging.getLogger('facts')
 
-    def process_data(self, raw_data):
+    def process_data(self, raw_data: str) -> Tuple[int, str, str]:
         facts, hostname, certname = self.load_facts(raw_data)
         self.LOGGER.info("Sending facts for %s", hostname)
         code, message = self.send_facts(facts, hostname, certname)
@@ -157,7 +219,7 @@ class FactsHandler(BaseHandler):
         return (code, message, hostname)
 
     @staticmethod
-    def load_facts(raw_data):
+    def load_facts(raw_data: str) -> Tuple[dict, str, Optional[str]]:
         data = load_json_or_yaml(raw_data)
         # TODO: assert data is a dict?
 
@@ -170,7 +232,7 @@ class FactsHandler(BaseHandler):
         certname = data.get('certname')
         return (facts, hostname, certname)
 
-    def send_facts(self, facts, hostname, certname=None):
+    def send_facts(self, facts: dict, hostname: str, certname: Optional[str]=None) -> Tuple[int, str]:
         url = f'{FOREMAN_URL}/api/v2/hosts/facts'
         data = {'facts': facts, 'name': hostname}
         if certname:
@@ -196,7 +258,7 @@ class ReportHandler(BaseHandler):
 
     LOGGER = logging.getLogger('report')
 
-    def process_data(self, raw_data):
+    def process_data(self, raw_data: str) -> Tuple[int, str, str]:
         # Puppet serializes the Ruby object
         raw_data = raw_data.replace('--- !ruby/object:Puppet::Transaction::Report', '---')
 
@@ -207,7 +269,7 @@ class ReportHandler(BaseHandler):
 
         return (code, message, hostname)
 
-    def send_report(self, config_report):
+    def send_report(self, config_report: dict) -> Tuple[int, str]:
         hostname = config_report['config_report']['host']
         url = f'{FOREMAN_URL}/api/v2/config_reports'
         self.LOGGER.info('POST %s for %s', url, hostname)
@@ -224,7 +286,7 @@ class ReportHandler(BaseHandler):
         return (code, message)
 
     @classmethod
-    def build_config_report(cls, report):
+    def build_config_report(cls, report: dict) -> dict:
         """
         Change the Puppet format report format to what Foreman's API
         understands.
@@ -247,7 +309,7 @@ class ReportHandler(BaseHandler):
                     hostname) from e
 
     @staticmethod
-    def calculate_status(report):
+    def calculate_status(report: dict) -> dict:
         # https://puppet.com/docs/puppet/7/format_report.html#puppet-util-metric
         metrics = report['metrics']
 
@@ -275,7 +337,7 @@ class ReportHandler(BaseHandler):
         return statuses
 
     @staticmethod
-    def format_metrics(metrics):
+    def format_metrics(metrics: dict) -> dict:
         """
         Convert Puppet's metrics to Foreman's API format.
         """
@@ -283,7 +345,7 @@ class ReportHandler(BaseHandler):
         return {name: {n: v for n, _, v in metric['values']} for name, metric in metrics.items()}
 
     @staticmethod
-    def format_logs(logs):
+    def format_logs(logs: list) -> Generator[dict, None, None]:
         """
         Convert Puppet's logs to match Foreman's slightly odd API format.
         """
@@ -335,8 +397,8 @@ if __name__ == "__main__":
         print(f'Unknown handler "{handler_name}"')
         sys.exit(1)
 
-    server = Server(f'/{handler_name}', handler)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+    with Server(f'/{handler_name}', handler) as server:
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass

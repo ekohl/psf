@@ -6,16 +6,20 @@ Release:       1%{?dist}
 Summary:       Foreman integration for Puppetserver
 
 License:       MIT
-URL:           https://github.com/ekohl/puppetserver-foreman
+URL:           https://github.com/ekohl/psf
 Source0:       https://codeload.github.com/ekohl/%{name}/tar.gz/%{version}#/%{name}-%{version}.tar.gz
 BuildArch:     noarch
 
 BuildRequires: python3-rpm-macros
 BuildRequires: systemd-rpm-macros
 
+# Client
+Requires:      socat
+
+# Server
 Requires:      python%{python3_version}dist(pyyaml)
 Requires:      python%{python3_version}dist(requests)
-Requires:      socat
+# This provides the puppet user which psfd@.socket uses
 Requires:      puppetserver
 
 %description
@@ -35,18 +39,18 @@ install -D -m 0644 client/puppet-psf/lib/puppet/indirector/facts/psf.rb %{buildr
 install -D -m 0644 client/puppet-psf/lib/puppet/reports/psf.rb %{buildroot}%{puppet_vendor_ruby}/puppet/reports/psf.rb
 
 # Server
-install -D -m 0755 -t %{buildroot}%{_bindir} server/direct/puppetserver-foreman
-install -D -m 0644 -t %{buildroot}%{_unitdir} server/direct/puppetserver-foreman@.{service,socket}
-install -D -m 0600 -t %{buildroot}%{_sysconfdir}/psf server/direct/credentials
+install -D -m 0755 -t %{buildroot}%{_bindir} server/psfd
+install -D -m 0644 -t %{buildroot}%{_unitdir} server/psfd@.{service,socket}
+install -D -m 0600 -t %{buildroot}%{_sysconfdir}/psf server/credentials
 
 %post
-%systemd_post puppetserver-foreman@.socket puppetserver-foreman@.service
+%systemd_post psfd@.socket psfd@.service
 
 %preun
-%systemd_preun puppetserver-foreman@.socket puppetserver-foreman@.service
+%systemd_preun psfd@.socket psfd@.service
 
 %postun
-%systemd_postun_with_restart puppetserver-foreman@.socket puppetserver-foreman@.service
+%systemd_postun_with_restart psfd@.socket psfd@.service
 
 %files
 # Client
@@ -57,7 +61,7 @@ install -D -m 0600 -t %{buildroot}%{_sysconfdir}/psf server/direct/credentials
 %{puppet_vendor_ruby}/puppet/reports/psf.rb
 
 # Server
-%{_bindir}/puppetserver-foreman
-%{_unitdir}/puppetserver-foreman@.service
-%{_unitdir}/puppetserver-foreman@.socket
+%{_bindir}/psfd
+%{_unitdir}/psfd@.service
+%{_unitdir}/psfd@.socket
 %config(noreplace) %{_sysconfdir}/psf/credentials

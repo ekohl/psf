@@ -3,7 +3,7 @@ Description=Foreman integration for Puppetserver
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/puppetserver-foreman %i
+ExecStart=/usr/bin/psfd %i
 EnvironmentFile=/etc/psf/credentials
 
 # TODO: Some of these are unknown on EL7
