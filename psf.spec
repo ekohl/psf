@@ -21,6 +21,8 @@ Requires:      python%{python3_version}dist(pyyaml)
 Requires:      python%{python3_version}dist(requests)
 # This provides the puppet user which psfd@.socket uses
 Requires:      puppetserver
+# This provides the foreman-proxy user which psfd@.service uses
+Requires:      foreman-proxy
 
 %description
 %{summary}

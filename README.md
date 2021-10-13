@@ -4,16 +4,12 @@ PSF aims to bring Foreman integration to Puppetserver. The core design is that i
 
 ## Installation
 
-Installation is only tested on EL8. Systemd on EL7 is too old to support DynamicUser=yes which decreases security.
-
-First install & configure PSF:
+This assumes an existing foreman-proxy setup with the Puppet feature enabled. Then install & configure PSF:
 
 ```bash
 dnf install -y epel-release https://yum.puppet.com/puppet7-release-el-8.noarch.rpm
 
 dnf localinstall ~/psf-0.1.0-1.el8.noarch.rpm
-# Edit /etc/psf/credentials
-# Edit /etc/psf/ca.pem
 systemctl enable --now puppetserver-foreman@{enc,facts,report}.socket
 ```
 
@@ -55,10 +51,12 @@ Now you'll find the result in `/var/lib/mock/centos-8-x86_64/result`.
 
 The goal of PSF is to make integration easy and flexible. In particular, there are multiple ways of connecting to Foreman. To achieve this, a client-server architecture was chosen. To keep authentication easy, unix sockets are used. Simple POSIX file permissions are used to only allow the user `puppet` access. Systemd is used to separate the listening socket and actual service. This allows the service to run under a different user.
 
-### Direct
-
-The direct mode uses the Foreman API directly. Basic authentication is used, which is typically a username and password. The Foreman URL must be configured. An optional CA file can be specified. If it isn't, the system store is used. The daemon runs under a dynamic user, which means systemd generates a POSIX user on the fly.
-
 ## Proxy
 
 This reuses the Foreman Proxy configuration. Foreman Proxy already knows the Foreman URL and also has certificates configured. The daemon runs under the `foreman-proxy` user.
+
+So from `/etc/foreman-proxy/settings.yml` it uses `:foreman_url`, `:foreman_ssl_ca`, `:foreman_ssl_cert`, `:foreman_ssl_key`.
+
+### Direct
+
+The direct mode uses the Foreman API directly. Basic authentication is used, which is typically a username and password. The Foreman URL must be configured. An optional CA file can be specified. If it isn't, the system store is used. The daemon runs under a dynamic user, which means systemd generates a POSIX user on the fly.

@@ -61,7 +61,7 @@ def load_settings(mode: str) -> str:
     raise ValueError('Unknown mode')
 
 try:
-    FOREMAN_URL = load_settings('direct')  # TODO: mode
+    FOREMAN_URL = load_settings('proxy')  # TODO: mode
 except ValueError as e:
     raise SystemExit(str(e)) from e
 
