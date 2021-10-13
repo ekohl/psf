@@ -50,3 +50,15 @@ mock -r centos-8-x86_64 psf-$VERSION-1.*.src.rpm
 ```
 
 Now you'll find the result in `/var/lib/mock/centos-8-x86_64/result`.
+
+## Design
+
+The goal of PSF is to make integration easy and flexible. In particular, there are multiple ways of connecting to Foreman. To achieve this, a client-server architecture was chosen. To keep authentication easy, unix sockets are used. Simple POSIX file permissions are used to only allow the user `puppet` access. Systemd is used to separate the listening socket and actual service. This allows the service to run under a different user.
+
+### Direct
+
+The direct mode uses the Foreman API directly. Basic authentication is used, which is typically a username and password. The Foreman URL must be configured. An optional CA file can be specified. If it isn't, the system store is used. The daemon runs under a dynamic user, which means systemd generates a POSIX user on the fly.
+
+## Proxy
+
+This reuses the Foreman Proxy configuration. Foreman Proxy already knows the Foreman URL and also has certificates configured. The daemon runs under the `foreman-proxy` user.
